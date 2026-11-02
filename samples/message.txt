@@ -1,0 +1,4 @@
+shared memory is fast
+first update
+latest-only
+abcdefghijklmnopqrstuvwxyz
