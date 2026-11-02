@@ -22,9 +22,20 @@ void cleanup_segment(int segment_id, struct shared_block *block) {
 }
 
 static void wait_for_ready(const struct shared_block *block) {
-    while (!block->ready) {
+    while (!__atomic_load_n(&block->ready, __ATOMIC_ACQUIRE)) {
         usleep(1000);
     }
+}
+
+static void finish_child(struct shared_block *block) {
+    int failed = fflush(stdout) == EOF;
+
+    if (shmdt(block) == -1) {
+        perror("shmdt");
+        failed = 1;
+    }
+    /* Do not return to main and accidentally run the remaining tasks. */
+    _exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 int task_fast_exchange(void) {
@@ -32,6 +43,9 @@ int task_fast_exchange(void) {
     pid_t child_pid;
     int status;
     struct shared_block *block;
+    const char source[] = "shared memory is fast";
+    const size_t chunk_size = sizeof(block->message) - 1;
+    size_t offset;
 
     segment_id = create_segment();
     if (segment_id == -1) {
@@ -42,6 +56,9 @@ int task_fast_exchange(void) {
     block = shmat(segment_id, NULL, 0);
     if (block == (void *)-1) {
         perror("shmat");
+        if (shmctl(segment_id, IPC_RMID, NULL) == -1) {
+            perror("shmctl");
+        }
         return 1;
     }
     memset(block, 0, sizeof(*block));
@@ -54,15 +71,31 @@ int task_fast_exchange(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait until parent marks block->ready. */
-        /* TODO: print: child fast read: shared memory is fast */
-        /* TODO: detach shared memory and return 0 on success. */
-        fprintf(stderr, "TODO: task_fast_exchange child path not implemented\n");
-        return 1;
+        char received[sizeof(source)] = {0};
+
+        /* The 20-character message needs two transfers through 16 bytes. */
+        for (offset = 0; offset < sizeof(source) - 1; offset += chunk_size) {
+            size_t bytes = sizeof(source) - 1 - offset;
+            if (bytes > chunk_size) {
+                bytes = chunk_size;
+            }
+            wait_for_ready(block);
+            memcpy(received + offset, block->message, bytes);
+            /* Acknowledge the read before the parent reuses the buffer. */
+            __atomic_store_n(&block->ready, 0, __ATOMIC_RELEASE);
+        }
+        printf("child fast read: %s\n", received);
+        finish_child(block);
     }
 
-    /* TODO: copy "shared memory is fast" into block->message. */
-    /* TODO: set block->ready = 1 so child can read it. */
+    for (offset = 0; offset < sizeof(source) - 1; offset += chunk_size) {
+        snprintf(block->message, sizeof(block->message), "%.*s",
+                 (int)chunk_size, source + offset);
+        __atomic_store_n(&block->ready, 1, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&block->ready, __ATOMIC_ACQUIRE)) {
+            usleep(1000);
+        }
+    }
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -70,6 +103,8 @@ int task_fast_exchange(void) {
         return 1;
     }
 
+    printf("parent fast write: done\n");
+    fflush(stdout);
     cleanup_segment(segment_id, block);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
@@ -89,6 +124,9 @@ int task_latest_value_limit(void) {
     block = shmat(segment_id, NULL, 0);
     if (block == (void *)-1) {
         perror("shmat");
+        if (shmctl(segment_id, IPC_RMID, NULL) == -1) {
+            perror("shmctl");
+        }
         return 1;
     }
     memset(block, 0, sizeof(*block));
@@ -101,15 +139,14 @@ int task_latest_value_limit(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait until parent sets ready. */
-        /* TODO: print: child latest view: latest-only */
-        /* TODO: detach and return 0 on success. */
-        fprintf(stderr, "TODO: task_latest_value_limit child path not implemented\n");
-        return 1;
+        wait_for_ready(block);
+        printf("child latest view: %s\n", block->message);
+        finish_child(block);
     }
 
-    /* TODO: parent writes "first update" then "latest-only" to block->message. */
-    /* TODO: set ready and let child read only the latest value. */
+    snprintf(block->message, sizeof(block->message), "%s", "first update");
+    snprintf(block->message, sizeof(block->message), "%s", "latest-only");
+    __atomic_store_n(&block->ready, 1, __ATOMIC_RELEASE);
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -117,6 +154,8 @@ int task_latest_value_limit(void) {
         return 1;
     }
 
+    printf("limit observed: no history in shared memory\n");
+    fflush(stdout);
     cleanup_segment(segment_id, block);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
@@ -137,6 +176,9 @@ int task_capacity_limit(void) {
     block = shmat(segment_id, NULL, 0);
     if (block == (void *)-1) {
         perror("shmat");
+        if (shmctl(segment_id, IPC_RMID, NULL) == -1) {
+            perror("shmctl");
+        }
         return 1;
     }
     memset(block, 0, sizeof(*block));
@@ -149,16 +191,15 @@ int task_capacity_limit(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait for ready flag. */
-        /* TODO: print: child capacity bytes: 15 */
-        /* TODO: detach and return 0 on success. */
-        fprintf(stderr, "TODO: task_capacity_limit child path not implemented\n");
-        return 1;
+        wait_for_ready(block);
+        printf("child capacity bytes: %zu\n", strlen(block->message));
+        finish_child(block);
     }
 
-    (void)source;
-    /* TODO: copy source into block->message safely with snprintf. */
-    /* TODO: set ready, wait for child, then print: parent source bytes: 26 */
+    /* Leave one byte for the terminating NUL; explicitly bound the format. */
+    snprintf(block->message, sizeof(block->message), "%.*s",
+             (int)sizeof(block->message) - 1, source);
+    __atomic_store_n(&block->ready, 1, __ATOMIC_RELEASE);
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -166,6 +207,8 @@ int task_capacity_limit(void) {
         return 1;
     }
 
+    printf("parent source bytes: %zu\n", strlen(source));
+    fflush(stdout);
     cleanup_segment(segment_id, block);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
